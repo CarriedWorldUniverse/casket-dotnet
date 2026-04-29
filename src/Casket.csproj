@@ -12,7 +12,7 @@
     <Version>0.1.0-alpha</Version>
     <Authors>dMonGirl</Authors>
     <Copyright>Copyright (c) dMonGirl 2026</Copyright>
-    <Description>Authenticated encryption and Ed25519 channel identity for .NET. AES-256-GCM and ChaCha20-Poly1305 with Argon2id key derivation. Cross-compatible wire format with @nexus-cw/casket (Node.js) and casket-go.</Description>
+    <Description>Authenticated encryption and Ed25519 channel identity for .NET. AES-256-GCM and ChaCha20-Poly1305 with Argon2id key derivation. Cross-compatible wire format with @nexus-cw/casket (casket-ts) and casket-go.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>cryptography encryption aes-gcm argon2 authenticated-encryption ed25519 ecdh channel</PackageTags>
     <PackageProjectUrl>https://github.com/nexus-cw/casket-dotnet</PackageProjectUrl>
