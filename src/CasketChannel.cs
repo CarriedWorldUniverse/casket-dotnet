@@ -10,6 +10,15 @@ using NSec.Cryptography;
 
 namespace Casket;
 
+/// <summary>ECDH curve used for key exchange. Both sides of a pair must match.</summary>
+public enum DhAlgorithm
+{
+    /// <summary>NIST P-256. Supported on all target frameworks. FIPS-compliant.</summary>
+    P256,
+    /// <summary>X25519. Requires net6.0 or later.</summary>
+    X25519,
+}
+
 /// <summary>
 /// Wire-format token exchanged out-of-band between two Frame operators.
 /// Serialize with <see cref="CasketChannel.SerializePairingToken"/> for paste/QR.
@@ -23,7 +32,9 @@ public sealed class CasketPairingToken
     public string Pubkey { get; init; } = "";
     /// <summary>Signing algorithm: "ed25519" on .NET 6+, "p256" on netstandard2.1.</summary>
     public string SigAlg { get; init; } = "";
-    /// <summary>base64url uncompressed ECDH P-256 public key (65 bytes: 0x04 || X || Y).</summary>
+    /// <summary>ECDH curve — "P-256" or "X25519". Both sides must match.</summary>
+    public string DhAlg { get; init; } = "P-256";
+    /// <summary>base64url ECDH public key (65 bytes uncompressed P-256, or 32 bytes X25519).</summary>
     public string DhPubkey { get; init; } = "";
     public string Endpoint { get; init; } = "";
     public string Nonce { get; init; } = "";
@@ -36,6 +47,7 @@ public sealed class CasketPeerRecord
     public string NexusId { get; init; } = "";
     public string Pubkey { get; init; } = "";
     public string SigAlg { get; init; } = "";
+    public string DhAlg { get; init; } = "P-256";
     public string DhPubkey { get; init; } = "";
     public string Endpoint { get; init; } = "";
     public string PathId { get; init; } = "";
@@ -52,13 +64,15 @@ public sealed class CasketChannel : IDisposable
     private const string SigPubKey  = "casket:channel:sig_public_key";
     private const string DhPrivKey  = "casket:channel:dh_private_key";
     private const string DhPubKey   = "casket:channel:dh_public_key";
+    private const string DhAlgKey   = "casket:channel:dh_alg";
     private const string PeerPrefix = "casket:peers:";
 
     private readonly string _nexusId;
     private readonly byte[] _sigPrivateKeyBytes;  // Ed25519 seed (32B) on .NET 6+, PKCS8 P-256 on netstandard2.1
     private readonly byte[] _sigPublicKeyBytes;   // Ed25519 raw pub (32B) on .NET 6+, SPKI P-256 on netstandard2.1
-    private readonly byte[] _dhPrivateKeyBytes;   // PKCS8 P-256
-    private readonly byte[] _dhPublicKeyBytes;    // raw 65-byte uncompressed P-256
+    private readonly byte[] _dhPrivateKeyBytes;   // PKCS8 (P-256) or raw scalar (X25519, net6+)
+    private readonly byte[] _dhPublicKeyBytes;    // 65-byte uncompressed P-256, or 32-byte X25519 raw key
+    private readonly DhAlgorithm _dhAlg;
     private readonly ICasketChannelStorage _storage;
     private bool _disposed;
 
@@ -66,6 +80,7 @@ public sealed class CasketChannel : IDisposable
         string nexusId,
         byte[] sigPriv, byte[] sigPub,
         byte[] dhPriv,  byte[] dhPub,
+        DhAlgorithm dhAlg,
         ICasketChannelStorage storage)
     {
         _nexusId = nexusId;
@@ -73,25 +88,35 @@ public sealed class CasketChannel : IDisposable
         _sigPublicKeyBytes  = sigPub;
         _dhPrivateKeyBytes  = dhPriv;
         _dhPublicKeyBytes   = dhPub;
+        _dhAlg   = dhAlg;
         _storage = storage;
     }
 
+    /// <summary>
+    /// Loads the channel from storage, generating keypairs on first run.
+    /// <paramref name="dhAlgorithm"/> is ignored on reload — the stored algorithm wins.
+    /// Default: <see cref="DhAlgorithm.P256"/> (supported on all target frameworks).
+    /// X25519 requires net6.0 or later.
+    /// </summary>
     public static async ValueTask<CasketChannel> LoadAsync(
         string nexusId,
         ICasketChannelStorage storage,
+        DhAlgorithm dhAlgorithm = DhAlgorithm.P256,
         CancellationToken cancellationToken = default)
     {
         string? storedSigPriv = await storage.GetAsync(SigPrivKey, cancellationToken).ConfigureAwait(false);
         string? storedSigPub  = await storage.GetAsync(SigPubKey,  cancellationToken).ConfigureAwait(false);
         string? storedDhPriv  = await storage.GetAsync(DhPrivKey,  cancellationToken).ConfigureAwait(false);
         string? storedDhPub   = await storage.GetAsync(DhPubKey,   cancellationToken).ConfigureAwait(false);
+        string? storedDhAlg   = await storage.GetAsync(DhAlgKey,   cancellationToken).ConfigureAwait(false);
 
         if (storedSigPriv != null && storedSigPub != null && storedDhPriv != null && storedDhPub != null)
         {
+            DhAlgorithm reloadedAlg = ParseDhAlg(storedDhAlg) ?? DhAlgorithm.P256;
             return new CasketChannel(nexusId,
                 B64uDecode(storedSigPriv), B64uDecode(storedSigPub),
                 B64uDecode(storedDhPriv),  B64uDecode(storedDhPub),
-                storage);
+                reloadedAlg, storage);
         }
 
         // First run — generate both keypairs.
@@ -104,6 +129,8 @@ public sealed class CasketChannel : IDisposable
             sigPub  = sigKey.PublicKey.Export(KeyBlobFormat.RawPublicKey);
         }
 #else
+        if (dhAlgorithm == DhAlgorithm.X25519)
+            throw new CasketConfigurationException("X25519 requires net6.0 or later.");
         using (var ecdsa = CreateSigningKey())
         {
             sigPriv = ecdsa.ExportPkcs8PrivateKey();
@@ -112,28 +139,40 @@ public sealed class CasketChannel : IDisposable
 #endif
 
         byte[] dhPriv, dhPubRaw;
-        using (var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256))
-        {
-            dhPriv  = ecdh.ExportPkcs8PrivateKey();
-            dhPubRaw = ExportEcdhPublicKeyRaw(ecdh);
-        }
+        (dhPriv, dhPubRaw) = GenerateDhKeypair(dhAlgorithm);
 
-        await storage.PutAsync(SigPrivKey, B64uEncode(sigPriv),  cancellationToken).ConfigureAwait(false);
-        await storage.PutAsync(SigPubKey,  B64uEncode(sigPub),   cancellationToken).ConfigureAwait(false);
-        await storage.PutAsync(DhPrivKey,  B64uEncode(dhPriv),   cancellationToken).ConfigureAwait(false);
-        await storage.PutAsync(DhPubKey,   B64uEncode(dhPubRaw), cancellationToken).ConfigureAwait(false);
+        await storage.PutAsync(SigPrivKey, B64uEncode(sigPriv),           cancellationToken).ConfigureAwait(false);
+        await storage.PutAsync(SigPubKey,  B64uEncode(sigPub),            cancellationToken).ConfigureAwait(false);
+        await storage.PutAsync(DhPrivKey,  B64uEncode(dhPriv),            cancellationToken).ConfigureAwait(false);
+        await storage.PutAsync(DhPubKey,   B64uEncode(dhPubRaw),          cancellationToken).ConfigureAwait(false);
+        await storage.PutAsync(DhAlgKey,   FormatDhAlg(dhAlgorithm),      cancellationToken).ConfigureAwait(false);
 
-        return new CasketChannel(nexusId, sigPriv, sigPub, dhPriv, dhPubRaw, storage);
+        return new CasketChannel(nexusId, sigPriv, sigPub, dhPriv, dhPubRaw, dhAlgorithm, storage);
     }
 
-    public string NexusId        => _nexusId;
-    public string PublicKeyB64u  => B64uEncode(_sigPublicKeyBytes);
+    public string NexusId         => _nexusId;
+    public string PublicKeyB64u   => B64uEncode(_sigPublicKeyBytes);
     public string DhPublicKeyB64u => B64uEncode(_dhPublicKeyBytes);
+    public DhAlgorithm DhAlg      => _dhAlg;
 #if NET6_0_OR_GREATER
     public const string SigAlgId = "ed25519";
 #else
     public const string SigAlgId = "p256";
 #endif
+
+    /// <summary>Sign arbitrary bytes with the channel's own Ed25519 key (pre-pairing use).</summary>
+    public string Sign(ReadOnlySpan<byte> data)
+    {
+#if NET6_0_OR_GREATER
+        var ed25519Alg = SignatureAlgorithm.Ed25519;
+        using var sigKey = Key.Import(ed25519Alg, _sigPrivateKeyBytes, KeyBlobFormat.RawPrivateKey);
+        byte[] sig = ed25519Alg.Sign(sigKey, data);
+#else
+        using var ecdsa = CreateAndImportSigning(_sigPrivateKeyBytes);
+        byte[] sig = ecdsa.SignData(data.ToArray(), HashAlgorithmName.SHA256);
+#endif
+        return B64uEncode(sig);
+    }
 
     public CasketPairingToken MakePairingToken(string endpoint)
     {
@@ -145,6 +184,7 @@ public sealed class CasketChannel : IDisposable
             NexusId  = _nexusId,
             Pubkey   = PublicKeyB64u,
             SigAlg   = SigAlgId,
+            DhAlg    = FormatDhAlg(_dhAlg),
             DhPubkey = DhPublicKeyB64u,
             Endpoint = endpoint,
             Nonce    = B64uEncode(nonce),
@@ -174,19 +214,27 @@ public sealed class CasketChannel : IDisposable
         if (age > maxAgeSeconds || age < -300)
             throw new CasketChannelPairException($"Pairing token is too old or from the future (age={age}s).");
 
+        DhAlgorithm peerDhAlg = ParseDhAlg(token.DhAlg) ?? DhAlgorithm.P256;
+        if (peerDhAlg != _dhAlg)
+            throw new CasketChannelPairException(
+                $"DH algorithm mismatch: local={FormatDhAlg(_dhAlg)}, peer={FormatDhAlg(peerDhAlg)}. Both sides must use the same curve.");
+
         byte[] peerDhPubRaw = B64uDecode(token.DhPubkey);
-        if (peerDhPubRaw.Length != 65)
-            throw new CasketChannelPairException("Peer ECDH public key must be 65 bytes (uncompressed P-256).");
+        int expectedDhBytes = _dhAlg == DhAlgorithm.P256 ? 65 : 32;
+        if (peerDhPubRaw.Length != expectedDhBytes)
+            throw new CasketChannelPairException(
+                $"Peer {FormatDhAlg(_dhAlg)} public key must be {expectedDhBytes} bytes, got {peerDhPubRaw.Length}.");
 
         byte[] peerSigPub = B64uDecode(token.Pubkey);
-        string pathId   = ComputePathId(_sigPublicKeyBytes, peerSigPub);
-        byte[] sharedKey = DeriveSharedKey(_dhPrivateKeyBytes, peerDhPubRaw);
+        string pathId    = ComputePathId(_sigPublicKeyBytes, peerSigPub);
+        byte[] sharedKey = DeriveSharedKey(_dhAlg, _dhPrivateKeyBytes, peerDhPubRaw);
 
         var record = new CasketPeerRecord
         {
             NexusId  = token.NexusId,
             Pubkey   = token.Pubkey,
             SigAlg   = token.SigAlg,
+            DhAlg    = FormatDhAlg(peerDhAlg),
             DhPubkey = token.DhPubkey,
             Endpoint = token.Endpoint,
             PathId   = pathId,
@@ -207,7 +255,8 @@ public sealed class CasketChannel : IDisposable
 
         var record = JsonSerializer.Deserialize(raw, CasketChannelJsonContext.Default.CasketPeerRecord)
                      ?? throw new CasketConfigurationException("Corrupt peer record in storage.");
-        byte[] sharedKey = DeriveSharedKey(_dhPrivateKeyBytes, B64uDecode(record.DhPubkey));
+        DhAlgorithm peerDhAlg = ParseDhAlg(record.DhAlg) ?? DhAlgorithm.P256;
+        byte[] sharedKey = DeriveSharedKey(peerDhAlg, _dhPrivateKeyBytes, B64uDecode(record.DhPubkey));
         return new CasketPairedChannel(_sigPrivateKeyBytes, record, sharedKey);
     }
 
@@ -216,46 +265,93 @@ public sealed class CasketChannel : IDisposable
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    private static string FormatDhAlg(DhAlgorithm alg) => alg == DhAlgorithm.X25519 ? "X25519" : "P-256";
+
+    private static DhAlgorithm? ParseDhAlg(string? s) => s switch
+    {
+        "X25519" => DhAlgorithm.X25519,
+        "P-256"  => DhAlgorithm.P256,
+        null     => null,
+        _        => null,
+    };
+
+    private static (byte[] priv, byte[] pub) GenerateDhKeypair(DhAlgorithm alg)
+    {
+#if NET6_0_OR_GREATER
+        if (alg == DhAlgorithm.X25519)
+        {
+            var x25519Alg = KeyAgreementAlgorithm.X25519;
+            using var key = Key.Create(x25519Alg, new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport });
+            byte[] priv = key.Export(KeyBlobFormat.RawPrivateKey);   // 32-byte scalar
+            byte[] pub  = key.PublicKey.Export(KeyBlobFormat.RawPublicKey); // 32-byte point
+            return (priv, pub);
+        }
+#endif
+        using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        return (ecdh.ExportPkcs8PrivateKey(), ExportEcdhPublicKeyRaw(ecdh));
+    }
+
     // netstandard2.1 fallback only — Ed25519 CNG gap means P-256 is used there.
     // On .NET 6+ we use NSec.Cryptography (libsodium) for Ed25519.
 #if !NET6_0_OR_GREATER
     private static ECDsa CreateSigningKey()
         => ECDsa.Create(ECCurve.NamedCurves.nistP256);
+
+    private static ECDsa CreateAndImportSigning(byte[] pkcs8)
+    {
+        var key = ECDsa.Create(ECCurve.NamedCurves.nistP256)!;
+        key.ImportPkcs8PrivateKey(pkcs8, out _);
+        return key;
+    }
 #endif
 
-    private static byte[] DeriveSharedKey(byte[] dhPrivBytes, byte[] peerDhPubRaw)
+    private static byte[] DeriveSharedKey(DhAlgorithm alg, byte[] dhPrivBytes, byte[] peerDhPubRaw)
     {
-        using var local = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
-        local.ImportPkcs8PrivateKey(dhPrivBytes, out _);
+        byte[] rawSecret;
 
-        var ecParams = new ECParameters
+#if NET6_0_OR_GREATER
+        if (alg == DhAlgorithm.X25519)
         {
-            Curve = ECCurve.NamedCurves.nistP256,
-            Q = new ECPoint { X = peerDhPubRaw[1..33], Y = peerDhPubRaw[33..65] }
-        };
-        using var peerEc = ECDiffieHellman.Create(ecParams);
+            var x25519Alg = KeyAgreementAlgorithm.X25519;
+            using var localKey = Key.Import(x25519Alg, dhPrivBytes, KeyBlobFormat.RawPrivateKey);
+            var peerPub = PublicKey.Import(x25519Alg, peerDhPubRaw, KeyBlobFormat.RawPublicKey);
+            using var sharedSecret = x25519Alg.Agree(localKey, peerPub)
+                ?? throw new CasketChannelPairException("X25519 key agreement failed.");
+            // Derive 32-byte AES key via HKDF-SHA256 using NSec (matches our manual HkdfSha256).
+            // Salt = 32 zero bytes, info = "nexus-casket-channel-v1", matching casket-go.
+            var hkdf = KeyDerivationAlgorithm.HkdfSha256;
+            byte[] salt = new byte[32];
+            byte[] info = Encoding.UTF8.GetBytes("nexus-casket-channel-v1");
+            using var derivedKey = hkdf.DeriveKey(sharedSecret,
+                new ReadOnlySpan<byte>(salt), new ReadOnlySpan<byte>(info),
+                AeadAlgorithm.Aes256Gcm,
+                new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport });
+            return derivedKey.Export(KeyBlobFormat.RawSymmetricKey);
+        }
+#endif
+        {
+            using var local = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+            local.ImportPkcs8PrivateKey(dhPrivBytes, out _);
+
+            var ecParams = new ECParameters
+            {
+                Curve = ECCurve.NamedCurves.nistP256,
+                Q = new ECPoint { X = peerDhPubRaw[1..33], Y = peerDhPubRaw[33..65] }
+            };
+            using var peerEc = ECDiffieHellman.Create(ecParams);
 
 #if NET5_0_OR_GREATER
-        byte[] rawSecret = local.DeriveRawSecretAgreement(peerEc.PublicKey);
+            rawSecret = local.DeriveRawSecretAgreement(peerEc.PublicKey);
 #else
-        // netstandard2.1: use DeriveKeyMaterial with no KDF and extract via SHA-256
-        byte[] rawSecret = local.DeriveKeyFromHash(peerEc.PublicKey, HashAlgorithmName.SHA256);
-        // DeriveKeyFromHash already applies the hash, but we want the raw point X
-        // so we fall back to a manual approach using DeriveKeyMaterial
-        rawSecret = DeriveRawSecretNetStd(local, peerEc);
+            rawSecret = DeriveRawSecretNetStd(local, peerEc);
 #endif
-
-        return HkdfSha256(rawSecret, Encoding.UTF8.GetBytes("nexus-casket-channel-v1"));
+            return HkdfSha256(rawSecret, Encoding.UTF8.GetBytes("nexus-casket-channel-v1"));
+        }
     }
 
 #if !NET5_0_OR_GREATER
     private static byte[] DeriveRawSecretNetStd(ECDiffieHellman local, ECDiffieHellman peer)
-    {
-        // On netstandard2.1 there's no DeriveRawSecretAgreement.
-        // Use DeriveKeyFromHash with SHA256 over just the shared X coordinate.
-        // This matches what HKDF-Extract does when using the shared secret as IKM.
-        return local.DeriveKeyFromHash(peer.PublicKey, HashAlgorithmName.SHA256, null, null);
-    }
+        => local.DeriveKeyFromHash(peer.PublicKey, HashAlgorithmName.SHA256, null, null);
 #endif
 
     private static byte[] HkdfSha256(byte[] ikm, byte[] info, int outputLength = 32)
