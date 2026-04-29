@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (.NET ${{ matrix.dotnet }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        dotnet: ['8.0', '9.0', '10.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.x
+      - run: dotnet test tests/Casket.Tests.csproj --configuration Release
