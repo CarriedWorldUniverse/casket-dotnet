@@ -1,5 +1,9 @@
 # Casket.Net
 
+[![CI](https://github.com/CarriedWorldUniverse/casket-dotnet/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/CarriedWorldUniverse/casket-dotnet/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/CarriedWorldUniverse/casket-dotnet?include_prereleases&sort=semver&display_name=tag)](https://github.com/CarriedWorldUniverse/casket-dotnet/releases)
+[![License](https://img.shields.io/github/license/CarriedWorldUniverse/casket-dotnet)](LICENSE)
+
 Authenticated encryption and Ed25519 channel identity for .NET.
 
 - **AES-256-GCM** and **ChaCha20-Poly1305** with Argon2id key derivation
