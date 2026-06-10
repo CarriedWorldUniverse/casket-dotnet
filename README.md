@@ -7,8 +7,8 @@
 Authenticated encryption and Ed25519 channel identity for .NET.
 
 - **AES-256-GCM** and **ChaCha20-Poly1305** with Argon2id key derivation
-- **Channel** module: Ed25519/P-256 identity + ECDH E2E encryption for frame-to-frame relay
-- Cross-compatible wire format with [`@nexus-cw/casket`](https://github.com/nexus-cw/casket-ts) (Node.js / Cloudflare Workers) and [`casket-go`](https://github.com/nexus-cw/casket-go)
+- **Channel** module: Ed25519 identity + dual-curve ECDH (P-256 / X25519) for E2E encryption — pair-relay channels and at-rest envelopes
+- Cross-compatible channel wire format with [`casket-ts`](https://github.com/CarriedWorldUniverse/casket-ts) (Node.js / Cloudflare Workers) and [`casket-go`](https://github.com/CarriedWorldUniverse/casket-go) (Go)
 - Targets `netstandard2.1`, `net8.0`, `net9.0`, `net10.0`
 
 ## Install
